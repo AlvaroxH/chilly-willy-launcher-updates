@@ -1,0 +1,108 @@
+name: Compilar Chilly Willy Windows (sin usar tu PC)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - launcher-source.zip
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: chilly-willy-cloud-build
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Descargar el proyecto liviano
+        uses: actions/checkout@v4
+
+      - name: Preparar Node en el equipo de GitHub
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Extraer y localizar proyecto
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Expand-Archive -LiteralPath 'launcher-source.zip' -DestinationPath 'fuentes' -Force
+          $pkg = Get-ChildItem -Path 'fuentes' -Filter 'package.json' -File -Recurse | Select-Object -First 1
+          if (-not $pkg) { throw 'No se encontró package.json dentro del ZIP.' }
+          "APP_DIR=$($pkg.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $json = Get-Content -LiteralPath $pkg.FullName -Raw | ConvertFrom-Json
+          "LAUNCHER_VERSION=$($json.version)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Instalar dependencias y ejecutar pruebas en GitHub
+        shell: pwsh
+        run: |
+          Set-Location $env:APP_DIR
+          npm install --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'Falló npm install.' }
+          npm run test:manifest
+          if ($LASTEXITCODE -ne 0) { throw 'Fallaron las pruebas.' }
+
+      - name: Compilar Setup y Portable en Windows de GitHub
+        shell: pwsh
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          Set-Location $env:APP_DIR
+          npm run build:win
+          if ($LASTEXITCODE -ne 0) { throw 'Falló la compilación de Electron.' }
+
+      - name: Comprobar y preparar los cuatro archivos
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = Join-Path $env:APP_DIR 'release'
+          $ver = $env:LAUNCHER_VERSION
+          $names = @(
+            "Chilly-Willy-Launcher-Setup-$ver.exe",
+            "Chilly-Willy-Launcher-Setup-$ver.exe.blockmap",
+            "Chilly-Willy-Launcher-Portable-$ver.exe",
+            'latest.yml'
+          )
+          New-Item -ItemType Directory -Force -Path 'exe-terminados' | Out-Null
+          foreach ($n in $names) {
+            $f = Join-Path $release $n
+            if (-not (Test-Path -LiteralPath $f)) { throw "Falta el archivo: $n" }
+            Copy-Item -LiteralPath $f -Destination 'exe-terminados'
+          }
+          $latest = Get-Content -LiteralPath (Join-Path $release 'latest.yml') -Raw
+          if (-not $latest.Contains("Chilly-Willy-Launcher-Setup-$ver.exe")) {
+            throw 'latest.yml no coincide con el Setup.'
+          }
+          Get-ChildItem -Path 'exe-terminados' | Select-Object Name, Length
+
+      - name: Guardar los EXE para descargar desde Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: Chilly-Willy-Windows-${{ env.LAUNCHER_VERSION }}
+          path: exe-terminados/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Crear release en BORRADOR (no activa actualizaciones todavía)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$env:LAUNCHER_VERSION"
+          # No tocar una versión existente. Evita sobrescribir v0.9.10 u otra publicada.
+          $result = & gh.exe release list --repo $env:GITHUB_REPOSITORY --json tagName --limit 100
+          if ($LASTEXITCODE -ne 0) { throw 'No se pudieron listar las releases.' }
+          $versions = @($result | ConvertFrom-Json)
+          if (@($versions | Where-Object { $_ -and $_.tagName -eq $tag }).Count -gt 0) {
+            throw "Ya existe ${tag}: no se sobrescribe. Usá una versión nueva."
+          }
+          $files = @(Get-ChildItem -Path 'exe-terminados' -File | ForEach-Object { $_.FullName })
+          & gh.exe release create $tag @files --repo $env:GITHUB_REPOSITORY --target main --draft --title "Chilly Willy Launcher $tag" --notes "Versión $tag compilada por GitHub Actions. BORRADOR: probar antes de publicar." 
+          if ($LASTEXITCODE -ne 0) { throw 'No se pudo crear el borrador de la Release.' }
+          Write-Host "Borrador $tag creado. El updater NO lo ve hasta que el dueño publique la Release."
